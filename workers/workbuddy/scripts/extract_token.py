@@ -115,6 +115,10 @@ def find_workbuddy_runtime(explicit=None):
 
     candidates = []
     if sys.platform == "win32":
+        candidates.extend([
+            r"D:\workbuddy\WorkBuddy.exe",
+            r"C:\workbuddy\WorkBuddy.exe",
+        ])
         for env_key in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
             val = os.environ.get(env_key)
             if val:
@@ -177,7 +181,7 @@ def run_auth_helper(exe_path, request):
 
 
 def decrypt_value(value, exe):
-    reply = run_auth_helper(exe, {"operation": "decrypt", "value": value})
+    reply = run_auth_helper(exe, {"version": 1, "operation": "decrypt", "value": value})
     if not reply.get("ok"):
         raise AuthError(reply.get("reason") or "HELPER_PROTOCOL")
     return reply["accessToken"]
@@ -223,6 +227,11 @@ def extract(field="refreshToken", auth_file=None, exe_path=None):
 
 
 def main():
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
     ap = argparse.ArgumentParser(description="提取 WorkBuddy 登录态并在需要时推送到 Worker")
     ap.add_argument("--raw", action="store_true", help="打印明文令牌")
     ap.add_argument("--push", action="store_true", help="推送到 Worker 并执行一次签到验证")
