@@ -8,3 +8,10 @@ crons = ["7 0 * * *"]   # 每日 UTC 00:07 = 北京时间 08:07
 [[kv_namespaces]]
 binding = "WB"
 id = "YOUR_KV_NAMESPACE_ID"
+
+# [可选] 消息推送配置（也可用 npx wrangler secret put 配置为 Secret）
+# [vars]
+# FEISHU_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/xxxx"
+# BARK_KEY = "your_bark_device_key"
+# PUSHPLUS_TOKEN = "your_pushplus_token"
+
