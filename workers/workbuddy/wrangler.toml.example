@@ -1,0 +1,10 @@
+name = "wb-checkin"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[triggers]
+crons = ["7 0 * * *"]   # 每日 UTC 00:07 = 北京时间 08:07
+
+[[kv_namespaces]]
+binding = "WB"
+id = "YOUR_KV_NAMESPACE_ID"

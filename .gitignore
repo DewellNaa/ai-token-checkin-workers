@@ -1,0 +1,31 @@
+# Environment & Secrets
+.env
+*.env
+admin_key.txt
+credential.json
+oauth-state.json
+refresh_token.txt
+token-refresh.log
+*.log
+
+# Cloudflare Wrangler
+.wrangler/
+wrangler.toml
+
+# Dependencies
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Archives & Temp
+*.zip
+*.tar.gz
+*.bak
+tmp/
+temp/
+
+# OS specific
+.DS_Store
+Thumbs.db
+desktop.ini

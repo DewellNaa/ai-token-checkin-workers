@@ -1,0 +1,11 @@
+name = "qoder-daily-credits"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[triggers]
+# 每日北京时间 10:05（UTC 02:05）
+crons = ["5 2 * * *"]
+
+[[kv_namespaces]]
+binding = "Q"
+id = "YOUR_KV_NAMESPACE_ID"
