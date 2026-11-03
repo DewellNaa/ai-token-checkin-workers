@@ -1,29 +1,20 @@
 /**
- * WorkBuddy 每日自动签到 & 派猫旅行（Cloudflare Worker + Cron Trigger）
+ * WorkBuddy 每日自动签到（Cloudflare Worker + Cron Trigger + 飞书告警）
  *
- * 核心功能：
- *   1. 每日基础签到（自动轮换防踢下线，30天超长缓存保护）
- *   2. 派猫旅行自动化（自动查状态 -> 到达自动领奖 -> 挑选最高奖励地点自动出行）
- *   3. 多通道消息推送（支持飞书群机器人 Webhook、Bark、PushPlus 微信通知）
- *
- * 设计要点：
- *   - access_token 有效期 30 天，缓存在 KV，只有过期才 refresh，避免踢出本地桌面端。
- *   - 域名白名单守卫：仅允许向腾讯官方接口发起请求。
- *   - 敏感令牌全链路脱敏保护。
+ * 流程：
+ *   1. 从 KV 取 refresh_token
+ *   2. 换 access_token（顺带拿到轮换后的新 refresh_token，回写 KV）
+ *   3. 查签到状态；未签到则领取
+ *   4. 结果写入 KV 便于查看
+ *   5. 失败或令牌异常时推送飞书红色告警卡片
  */
 
 const API_HOST = 'https://copilot.tencent.com';
 const REFRESH_PATH = '/v2/plugin/auth/token/refresh';
 const STATUS_PATH = '/v2/billing/meter/checkin-activity-status';
 const CHECKIN_PATH = '/v2/billing/meter/daily-checkin';
-
-// 派猫旅行接口
-const TRAVEL_STATUS_PATH = '/activity/growth/buddy/travel/status';
-const TRAVEL_CONFIG_PATH = '/activity/growth/buddy/travel/config';
-const TRAVEL_DEPART_PATH = '/activity/growth/buddy/travel/depart';
-const TRAVEL_CLAIM_PATH = '/activity/growth/buddy/travel/claim';
-
 const ALLOWED_HOSTS = ['copilot.tencent.com', 'www.workbuddy.cn'];
+
 const KV_KEY = 'WB_SESSION';
 
 function mask(v) {
@@ -32,154 +23,77 @@ function mask(v) {
   return s.slice(0, 6) + '***' + s.slice(-4) + `(len=${s.length})`;
 }
 
-async function requestJson(method, path, headers = {}, body = null) {
+function beijingNow() {
+  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+}
+
+async function notifyFeishuCard(env, { title, tag = '🚨', template = 'red', markdownContent }) {
+  try {
+    const appId = env.FEISHU_APP_ID;
+    const appSecret = env.FEISHU_APP_SECRET;
+    const receiveId = env.FEISHU_RECEIVE_ID;
+
+    if (env.FEISHU_WEBHOOK_URL) {
+      await fetch(env.FEISHU_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          msg_type: 'interactive',
+          card: {
+            header: { title: { tag: 'plain_text', content: `${tag} ${title}` }, template },
+            elements: [{ tag: 'div', text: { tag: 'lark_md', content: markdownContent } }],
+          },
+        }),
+      });
+      return;
+    }
+
+    if (appId && appSecret && receiveId) {
+      const authResp = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+      });
+      const authData = await authResp.json();
+      if (authData.code === 0 && authData.tenant_access_token) {
+        await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            Authorization: `Bearer ${authData.tenant_access_token}`,
+          },
+          body: JSON.stringify({
+            receive_id: receiveId,
+            msg_type: 'interactive',
+            content: JSON.stringify({
+              header: { title: { tag: 'plain_text', content: `${tag} ${title}` }, template },
+              elements: [{ tag: 'div', text: { tag: 'lark_md', content: markdownContent } }],
+            }),
+          }),
+        });
+      }
+    }
+  } catch (err) {
+    console.error('Feishu notify error:', err);
+  }
+}
+
+async function postJson(path, headers) {
   const url = new URL(path, API_HOST);
   if (!ALLOWED_HOSTS.includes(url.hostname)) {
     throw new Error('host not allowed: ' + url.hostname);
   }
-  const opts = {
-    method,
+  const resp = await fetch(url.toString(), {
+    method: 'POST',
     headers: { 'Content-Type': 'application/json', ...headers },
-  };
-  if (body !== null) {
-    opts.body = JSON.stringify(body);
-  } else if (method === 'POST') {
-    opts.body = '{}';
-  }
-  const resp = await fetch(url.toString(), opts);
+    body: '{}',
+  });
   const text = await resp.text();
   try {
     return { status: resp.status, json: JSON.parse(text) };
   } catch {
     return { status: resp.status, json: { code: -1, msg: 'non-JSON response: ' + text.slice(0, 120) } };
   }
-}
-
-async function postJson(path, headers) {
-  return requestJson('POST', path, headers, {});
-}
-
-/**
- * 多渠道通知分发（飞书、Bark、PushPlus）
- */
-async function sendNotification(env, title, content) {
-  const tasks = [];
-
-  // 1. 飞书自定义群机器人
-  if (env.FEISHU_WEBHOOK) {
-    tasks.push(
-      fetch(env.FEISHU_WEBHOOK, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          msg_type: 'post',
-          content: {
-            post: {
-              zh_cn: {
-                title: title,
-                content: [[{ tag: 'text', text: content }]],
-              },
-            },
-          },
-        }),
-      }).catch((e) => console.error('Feishu notify error:', e))
-    );
-  }
-
-  // 2. Bark (iOS 推送)
-  if (env.BARK_URL || env.BARK_KEY) {
-    const barkBase = env.BARK_URL || `https://api.day.app/${env.BARK_KEY}`;
-    const url = `${barkBase.replace(/\/$/, '')}/${encodeURIComponent(title)}/${encodeURIComponent(content)}`;
-    tasks.push(fetch(url).catch((e) => console.error('Bark notify error:', e)));
-  }
-
-  // 3. PushPlus (微信公众号模板消息)
-  if (env.PUSHPLUS_TOKEN) {
-    tasks.push(
-      fetch('https://www.pushplus.plus/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          token: env.PUSHPLUS_TOKEN,
-          title: title,
-          content: content.replace(/\n/g, '<br/>'),
-          template: 'html',
-        }),
-      }).catch((e) => console.error('PushPlus notify error:', e))
-    );
-  }
-
-  if (tasks.length > 0) {
-    await Promise.allSettled(tasks);
-  }
-}
-
-/**
- * 派猫旅行自动化逻辑
- */
-async function handleTravel(accessToken) {
-  const authHeaders = { Authorization: `Bearer ${accessToken}` };
-
-  // 1. 查询旅行状态
-  const stResp = await requestJson('GET', TRAVEL_STATUS_PATH, authHeaders);
-  if (stResp.status !== 200 || !stResp.json || stResp.json.code !== 0) {
-    return { ok: false, step: 'travel_status', msg: stResp.json?.msg || 'query travel status failed' };
-  }
-
-  const d = stResp.json.data || {};
-  let state = d.state || 'idle';
-  const serverNow = d.server_now || Math.floor(Date.now() / 1000);
-  const arriveAt = d.arrive_at || 0;
-
-  // 2. 检查是否在途已到达
-  if (state === 'traveling' && arriveAt > 0 && serverNow >= arriveAt) {
-    state = 'arrived';
-  }
-
-  let claimResult = null;
-  // 3. 若已到达，自动领奖
-  if (state === 'arrived') {
-    const claimResp = await requestJson('POST', TRAVEL_CLAIM_PATH, authHeaders, {});
-    if (claimResp.json && claimResp.json.code === 0) {
-      const cd = claimResp.json.data || {};
-      claimResult = {
-        reward_credit: cd.reward_credit || cd.credit || 0,
-        letter: cd.letter || null,
-      };
-      state = 'idle'; // 领奖后恢复 idle，尝试触发今日出行
-    } else {
-      claimResult = { error: claimResp.json?.msg || 'claim failed' };
-    }
-  }
-
-  // 4. 若空闲且今日未达上限，挑选奖励最高地点派出
-  let departResult = null;
-  if (state === 'idle' && !d.daily_limit_reached) {
-    const cfgResp = await requestJson('GET', TRAVEL_CONFIG_PATH, authHeaders);
-    const locs = cfgResp.json?.data?.locations || [];
-    if (locs.length > 0) {
-      locs.sort((a, b) => (b.reward_credit_max || 0) - (a.reward_credit_max || 0) || (a.sort || 0) - (b.sort || 0));
-      const best = locs[0];
-      const depResp = await requestJson('POST', TRAVEL_DEPART_PATH, authHeaders, { location_id: best.id });
-      if (depResp.json && depResp.json.code === 0) {
-        departResult = {
-          location_name: best.name,
-          location_code: best.code,
-          arrive_at: depResp.json.data?.arrive_at || 0,
-        };
-      } else {
-        departResult = { error: depResp.json?.msg || 'depart failed' };
-      }
-    }
-  }
-
-  return {
-    ok: true,
-    previous_state: d.state,
-    claim: claimResult,
-    depart: departResult,
-    daily_limit_reached: Boolean(d.daily_limit_reached),
-  };
 }
 
 export default {
@@ -198,6 +112,12 @@ export default {
           lastResult: { at: new Date().toISOString(), ok: false, step: 'cron', msg: msg.slice(0, 200) },
         }));
       } catch (e) { /* ignore */ }
+      await notifyFeishuCard(env, {
+        title: 'WorkBuddy 定时任务执行异常',
+        tag: '🚨',
+        template: 'red',
+        markdownContent: `**平台**：WorkBuddy (腾讯)\n**时间**：${beijingNow()}\n**异常**：${msg}`,
+      });
       throw err;
     }
   },
@@ -208,10 +128,10 @@ export default {
 
     if (url.pathname === '/checkin') {
       if (!adminKey || url.searchParams.get('key') !== adminKey) {
-        return new Response(JSON.stringify({
-          ok: false, error: 'unauthorized',
-          hint: 'pass ?key=<ADMIN_KEY> (see wrangler secret ADMIN_KEY)',
-        }), { status: 401, headers: { 'Content-Type': 'application/json; charset=utf-8' } });
+        return new Response(JSON.stringify({ ok: false, error: 'unauthorized' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        });
       }
       const override = url.searchParams.get('token');
       const result = await run(env, override);
@@ -236,11 +156,30 @@ export default {
       }, null, 2), { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
     }
 
+    if (url.pathname === '/test-notify') {
+      if (!adminKey || url.searchParams.get('key') !== adminKey) {
+        return new Response(JSON.stringify({ ok: false, error: 'unauthorized' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        });
+      }
+      await notifyFeishuCard(env, {
+        title: 'WorkBuddy 签到告警通道连通性测试',
+        tag: 'ℹ️',
+        template: 'blue',
+        markdownContent: 'WorkBuddy (腾讯) 每日自动签到已成功对接飞书告警总线！\n- 每日连签成长值与派猫打工\n- 令牌失效即刻红色报警保护连签天数',
+      });
+      return new Response(JSON.stringify({ ok: true, msg: 'Test notification sent to Feishu' }), {
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
+    }
+
     return new Response(
-      'WorkBuddy checkin & travel worker\n' +
-      '  schedule: daily 08:07 (Asia/Shanghai) via Cloudflare Cron Trigger\n' +
-      '  GET /status  -> last result (masked)\n' +
-      '  GET /checkin?key=...  -> manual run\n', {
+      'WorkBuddy checkin worker\n' +
+      '  schedule: daily 08:07 Asia/Shanghai\n' +
+      '  GET /status  -> last result\n' +
+      '  GET /checkin?key=...  -> manual run\n' +
+      '  GET /test-notify?key=...  -> test feishu alert\n', {
       headers: { 'Content-Type': 'text/plain; charset=utf-8' },
     });
   },
@@ -255,110 +194,105 @@ async function run(env, tokenOverride) {
   if (!refreshToken) {
     const err = { at: now, ok: false, step: 'init', msg: 'no refresh_token in KV' };
     await env.WB.put(KV_KEY, JSON.stringify({ ...record, lastResult: err }));
+    await notifyFeishuCard(env, {
+      title: 'WorkBuddy 令牌缺失告警',
+      tag: '🚨',
+      template: 'red',
+      markdownContent: `**平台**：WorkBuddy (腾讯)\n**时间**：${beijingNow()}\n**错误**：KV 中缺失 Refresh Token，请在桌面端重新登录或同步。`,
+    });
     return err;
   }
 
   let accessToken = record.accessToken;
   const expiresAt = record.accessTokenExpiresAt || 0;
 
-  // 1. 令牌轮换检测（有效且余量 > 1天则复用）
   if (!accessToken || Date.now() > expiresAt - 86400000) {
     const r = await postJson(REFRESH_PATH, {
       'X-Refresh-Token': refreshToken,
       'X-Auth-Refresh-Source': 'plugin',
+      'X-Domain': 'copilot.tencent.com',
     });
-    if (r.status !== 200 || !r.json || r.json.code !== 0) {
+    if (r.json.code !== 0 || !r.json.data || !r.json.data.accessToken) {
       const err = {
         at: now, ok: false, step: 'refresh',
-        httpStatus: r.status,
-        code: r.json && r.json.code,
-        msg: (r.json && r.json.msg) || 'refresh failed',
+        msg: `refresh failed code=${r.json.code} msg=${r.json.msg}`,
       };
       await env.WB.put(KV_KEY, JSON.stringify({ ...record, lastResult: err }));
+      await notifyFeishuCard(env, {
+        title: 'WorkBuddy 令牌刷新失败告警',
+        tag: '🚨',
+        template: 'red',
+        markdownContent: `**平台**：WorkBuddy (腾讯)\n**时间**：${beijingNow()}\n**错误**：刷新令牌失败（code=${r.json.code} msg=${r.json.msg}），请注意检查连签天数。`,
+      });
       return err;
     }
-    const data = r.json.data || {};
-    accessToken = data.accessToken;
-    const newRefresh = data.refreshToken;
-    if (newRefresh && newRefresh !== refreshToken) {
-      refreshToken = newRefresh;
-    }
-    const expiresIn = Number(data.expiresIn) || (30 * 86400);
+    accessToken = r.json.data.accessToken;
+    const newRefresh = r.json.data.refreshToken;
+    if (newRefresh) refreshToken = newRefresh;
+    const ttl = r.json.data.expiresIn || 2592000;
     record = {
       ...record,
       refreshToken,
       accessToken,
-      accessTokenExpiresAt: Date.now() + (expiresIn * 1000),
+      accessTokenExpiresAt: Date.now() + ttl * 1000,
     };
   }
 
-  // 2. 每日签到
-  let checkinResult = {};
-  const st = await postJson(STATUS_PATH, { Authorization: `Bearer ${accessToken}` });
-  if (st.status === 200 && st.json && st.json.code === 0) {
-    const stData = st.json.data || {};
-    if (stData.today_checked_in) {
-      checkinResult = {
-        claim: 'already-checked-in',
-        streak_days: stData.streak_days,
-        growth_points: stData.growth_points,
-      };
+  const auth = { Authorization: `Bearer ${accessToken}` };
+  const s = await postJson(STATUS_PATH, auth);
+  let already = false;
+  let streak = null;
+  let total = null;
+  let active = true;
+  let endTime = null;
+  if (s.json.code === 0 && s.json.data) {
+    already = s.json.data.today_checked_in === true;
+    streak = s.json.data.streak_days;
+    total = s.json.data.total_credits;
+    active = s.json.data.active !== false;
+    endTime = s.json.data.end_time || null;
+  }
+
+  if (!active) {
+    const result = {
+      at: now, ok: true, step: 'skipped',
+      claim: 'activity-inactive',
+      note: 'Buddy加油站活动已结束（end_time=' + (endTime || 'n/a') + '），无需签到',
+      streak_days: streak, total_credits: total,
+    };
+    await env.WB.put(KV_KEY, JSON.stringify({ ...record, lastResult: result }));
+    return result;
+  }
+
+  let claimMsg = 'already-checked-in';
+  if (!already) {
+    const c = await postJson(CHECKIN_PATH, auth);
+    if (c.json.code === 0) {
+      claimMsg = `claimed +${(c.json.data && c.json.data.credit) || 100}`;
+      if (c.json.data && c.json.data.streak_days) streak = c.json.data.streak_days;
+    } else if (c.json.code === 10001) {
+      claimMsg = 'already-checked-in';
     } else {
-      const chk = await postJson(CHECKIN_PATH, { Authorization: `Bearer ${accessToken}` });
-      if (chk.status === 200 && chk.json && chk.json.code === 0) {
-        const cd = chk.json.data || {};
-        checkinResult = {
-          claim: 'claimed',
-          streak_days: cd.streak_days,
-          growth_points: cd.growth_points,
-        };
-      } else {
-        checkinResult = { claim: 'failed', msg: chk.json?.msg || 'checkin api error' };
-      }
+      claimMsg = `claim failed code=${c.json.code} msg=${c.json.msg}`;
+      await notifyFeishuCard(env, {
+        title: 'WorkBuddy 签到失败告警',
+        tag: '🚨',
+        template: 'red',
+        markdownContent: `**平台**：WorkBuddy (腾讯)\n**时间**：${beijingNow()}\n**错误**：签到接口返回 code=${c.json.code} msg=${c.json.msg}，连签天数可能会受影响！`,
+      });
     }
-  } else {
-    checkinResult = { claim: 'failed', msg: st.json?.msg || 'query status error' };
   }
 
-  // 3. 派猫旅行（自动到达领奖 + 自动派出新旅行）
-  let travelResult = {};
-  try {
-    travelResult = await handleTravel(accessToken);
-  } catch (err) {
-    travelResult = { ok: false, msg: String(err.message || err) };
-  }
-
-  const finalResult = {
+  const result = {
     at: now,
-    ok: true,
+    ok: claimMsg === 'already-checked-in' || claimMsg.startsWith('claimed +'),
     step: 'done',
-    checkin: checkinResult,
-    travel: travelResult,
+    claim: claimMsg,
+    streak_days: streak,
+    total_credits: total,
+    beijing_time: beijingNow(),
   };
 
-  await env.WB.put(KV_KEY, JSON.stringify({ ...record, lastResult: finalResult }));
-
-  // 4. 多通道消息推送
-  try {
-    const lines = [
-      `⏰ 时间：${now}`,
-      `📌 签到状态：${checkinResult.claim === 'already-checked-in' ? '今日已签到' : checkinResult.claim === 'claimed' ? '签到成功！' : '签到异常'} (连签 ${checkinResult.streak_days || 0} 天, 积分: ${checkinResult.growth_points || 0})`,
-    ];
-    if (travelResult.claim && travelResult.claim.reward_credit) {
-      lines.push(`🎁 旅行领奖：+${travelResult.claim.reward_credit} 积分${travelResult.claim.letter ? ` (信件: ${travelResult.claim.letter})` : ''}`);
-    }
-    if (travelResult.depart && travelResult.depart.location_name) {
-      lines.push(`🐱 派猫出行：已派出前往「${travelResult.depart.location_name}」`);
-    } else if (travelResult.daily_limit_reached) {
-      lines.push(`🐱 派猫出行：今日已达上限或旅行进行中`);
-    }
-    const daysLeft = ((record.accessTokenExpiresAt - Date.now()) / 86400000).toFixed(1);
-    lines.push(`🔑 令牌余量：剩余 ${daysLeft} 天`);
-
-    await sendNotification(env, 'WorkBuddy 自动签到与旅行简报', lines.join('\n'));
-  } catch (notifyErr) {
-    console.error('Notify execution failed:', notifyErr);
-  }
-
-  return finalResult;
+  await env.WB.put(KV_KEY, JSON.stringify({ ...record, lastResult: result }));
+  return result;
 }

@@ -1,12 +1,12 @@
 /**
- * MiniMax Code 每日签到 —— Cloudflare Worker
+ * MiniMax Code 每日签到 —— Cloudflare Worker (支持飞书告警)
  *
  * 流程（与 MiniMax Code 网页端一致）：
  *   1. 用 access token 调 GET  /minimax-cloud/api/v1/signin/status  看今天能不能领
  *   2. 能领才调              POST /minimax-cloud/api/v1/signin/claim   （上游自带幂等）
  *
  * 令牌管理：access token 寿命短（约 1-4 小时），refresh token 长期有效但一次性——
- * 刷新后上游会轮换，必须把新的 refresh token 写回 KV，否则下次刷新会失败。
+ * 刷新后上游会轮换，必须把新的 refresh token 写回 KV。
  *
  * KV 键：
  *   mm-cred  → { accessToken, refreshToken, expiresAt }
@@ -23,7 +23,62 @@ const OAUTH_FORM = {
 
 const KV_CRED = 'mm-cred';
 const KV_LAST = 'mm-last';
-const REFRESH_SKEW_MS = 120 * 1000; // 过期前 2 分钟就刷新，留出时钟偏差余量
+const REFRESH_SKEW_MS = 120 * 1000;
+
+function beijingNow() {
+  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+}
+
+async function notifyFeishuCard(env, { title, tag = '🚨', template = 'red', markdownContent }) {
+  try {
+    const appId = env.FEISHU_APP_ID;
+    const appSecret = env.FEISHU_APP_SECRET;
+    const receiveId = env.FEISHU_RECEIVE_ID;
+
+    if (env.FEISHU_WEBHOOK_URL) {
+      await fetch(env.FEISHU_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          msg_type: 'interactive',
+          card: {
+            header: { title: { tag: 'plain_text', content: `${tag} ${title}` }, template },
+            elements: [{ tag: 'div', text: { tag: 'lark_md', content: markdownContent } }],
+          },
+        }),
+      });
+      return;
+    }
+
+    if (appId && appSecret && receiveId) {
+      const authResp = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+      });
+      const authData = await authResp.json();
+      if (authData.code === 0 && authData.tenant_access_token) {
+        await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json; charset=utf-8',
+            Authorization: `Bearer ${authData.tenant_access_token}`,
+          },
+          body: JSON.stringify({
+            receive_id: receiveId,
+            msg_type: 'interactive',
+            content: JSON.stringify({
+              header: { title: { tag: 'plain_text', content: `${tag} ${title}` }, template },
+              elements: [{ tag: 'div', text: { tag: 'lark_md', content: markdownContent } }],
+            }),
+          }),
+        });
+      }
+    }
+  } catch (err) {
+    console.error('Feishu notify error:', err);
+  }
+}
 
 async function postForm(url, form) {
   const res = await fetch(url, {
@@ -37,9 +92,6 @@ async function postForm(url, form) {
   return { status: res.status, body };
 }
 
-/**
- * 用 refresh token 换新的 access token（并把轮换后的 refresh token 一起返回）。
- */
 async function refreshAccessToken(refreshToken) {
   const { status, body } = await postForm(`${ACCOUNT_BASE}/oauth2/token`, {
     grant_type: 'refresh_token',
@@ -52,7 +104,6 @@ async function refreshAccessToken(refreshToken) {
   }
   return {
     accessToken: body.access_token,
-    // 上游会轮换 refresh token；没给就沿用旧的
     refreshToken: typeof body.refresh_token === 'string' && body.refresh_token
       ? body.refresh_token
       : refreshToken,
@@ -60,13 +111,10 @@ async function refreshAccessToken(refreshToken) {
   };
 }
 
-/**
- * 拿一个可用的 access token：能用就直接用，快过期或没有才刷新。
- */
 async function ensureToken(env) {
   const cred = await env.MM.get(KV_CRED, 'json');
   if (!cred || !cred.refreshToken) {
-    throw new Error('未配置令牌：请先运行 scripts/minimax_authorize.py 完成 OAuth 设备码授权');
+    throw new Error('未配置令牌：请先在本地走一次 OAuth 设备码授权');
   }
   const fresh = cred.accessToken && Number(cred.expiresAt || 0) - REFRESH_SKEW_MS > Date.now();
   if (fresh) return cred;
@@ -76,9 +124,6 @@ async function ensureToken(env) {
   return next;
 }
 
-/**
- * 调签到接口。upstream 自带幂等（重复 claim 返回已签状态），重试是安全的。
- */
 async function callSignin(env, action, token) {
   const url = `${API_BASE}/${action}?timezone_id=${encodeURIComponent('Asia/Shanghai')}`;
   const res = await fetch(url, {
@@ -102,18 +147,9 @@ async function callSignin(env, action, token) {
   return body.data || {};
 }
 
-function beijingNow() {
-  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
-}
-
-/**
- * 今天的签到状态 → 面板。
- * days 里 status===2 表示「今天可领」。
- */
 function summarize(data) {
   const days = Array.isArray(data.days) ? data.days : [];
   const today = days.find((d) => d && d.is_today) || null;
-  // status 语义：1=未开始待领，2=可领，3=已领
   const st = today ? today.status : null;
   return {
     claimable: st === 2,
@@ -170,6 +206,17 @@ async function run(env) {
       error: (err && err.message) ? err.message : String(err),
     };
   }
+
+  // 发生异常时推飞书红色告警
+  if (!result.ok) {
+    await notifyFeishuCard(env, {
+      title: 'MiniMax Code 自动签到失败告警',
+      tag: '🚨',
+      template: 'red',
+      markdownContent: `**平台**：MiniMax Code (海螺)\n**时间**：${beijingNow()}\n**错误**：${result.error || result.claim}\n**建议**：请检查 OAuth 授权或重新运行授权脚本绑定。`,
+    });
+  }
+
   await env.MM.put(KV_LAST, JSON.stringify(result));
   return result;
 }
@@ -182,38 +229,26 @@ export default {
       console.log('result:', JSON.stringify(result));
     } catch (err) {
       console.error('cron error:', err && err.message ? err.message : String(err));
+      await notifyFeishuCard(env, {
+        title: 'MiniMax Code 定时任务执行异常',
+        tag: '🚨',
+        template: 'red',
+        markdownContent: `**平台**：MiniMax Code (海螺)\n**时间**：${beijingNow()}\n**异常**：${err && err.message ? err.message : String(err)}`,
+      });
     }
   },
 
   async fetch(request, env) {
     const url = new URL(request.url);
+    const adminKey = env.ADMIN_KEY || '';
 
-    if (url.pathname === '/status') {
-      const last = await env.MM.get(KV_LAST, 'json');
-      const cred = await env.MM.get(KV_CRED, 'json');
-      const accessValid = !!(cred && cred.accessToken && Number(cred.expiresAt || 0) > Date.now());
-      return new Response(JSON.stringify({
-        tokenSet: !!cred,
-        accessTokenValid: accessValid,
-        refreshToken: cred ? String(cred.refreshToken || '').slice(0, 12) + '…' : null,
-        lastResult: last || { note: 'no record yet' },
-      }, null, 2), { headers: { 'Content-Type': 'application/json; charset=utf-8' } });
-    }
-
-    if (url.pathname === '/checkin') {
+    if (url.pathname === '/claim') {
       const key = url.searchParams.get('key');
-      if (!env.ADMIN_KEY || key !== env.ADMIN_KEY) {
-        return new Response('unauthorized', { status: 401 });
-      }
-      const override = url.searchParams.get('token');
-      const overrideRefresh = url.searchParams.get('refresh_token');
-      if (override || overrideRefresh) {
-        const prev = (await env.MM.get(KV_CRED, 'json')) || {};
-        await env.MM.put(KV_CRED, JSON.stringify({
-          accessToken: override || prev.accessToken || '',
-          refreshToken: overrideRefresh || prev.refreshToken || '',
-          expiresAt: override ? Date.now() + 3600 * 1000 : (prev.expiresAt || 0),
-        }));
+      if (!adminKey || key !== adminKey) {
+        return new Response(JSON.stringify({ ok: false, error: 'unauthorized' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        });
       }
       const result = await run(env);
       return new Response(JSON.stringify(result, null, 2), {
@@ -221,11 +256,44 @@ export default {
       });
     }
 
+    if (url.pathname === '/status') {
+      const last = await env.MM.get(KV_LAST, 'json');
+      const cred = await env.MM.get(KV_CRED, 'json');
+      return new Response(JSON.stringify({
+        tokenSet: !!cred,
+        expiresAt: cred && cred.expiresAt ? new Date(cred.expiresAt).toISOString() : null,
+        lastResult: last,
+      }, null, 2), {
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
+    }
+
+    if (url.pathname === '/test-notify') {
+      const key = url.searchParams.get('key');
+      if (!adminKey || key !== adminKey) {
+        return new Response(JSON.stringify({ ok: false, error: 'unauthorized' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json; charset=utf-8' },
+        });
+      }
+      await notifyFeishuCard(env, {
+        title: 'MiniMax Code 签到告警通道连通性测试',
+        tag: 'ℹ️',
+        template: 'blue',
+        markdownContent: 'MiniMax Code (海螺) 每日自动签到已成功对接飞书告警总线！\n- 每日 400+ 积分云端自洽轮换\n- 授权失效即刻红色报警',
+      });
+      return new Response(JSON.stringify({ ok: true, msg: 'Test notification sent to Feishu' }), {
+        headers: { 'Content-Type': 'application/json; charset=utf-8' },
+      });
+    }
+
     return new Response(
-      'MiniMax Code checkin worker.\n'
-      + 'GET  /status   → 查看上次结果与令牌状态\n'
-      + 'GET  /checkin?key=<ADMIN_KEY>[&token=<access>][&refresh_token=<refresh>]  → 手动触发\n',
-      { headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
-    );
+      'MiniMax Code daily checkin worker\n' +
+      '  schedule: daily 10:05 Asia/Shanghai\n' +
+      '  GET /status  -> last result\n' +
+      '  GET /claim?key=...  -> manual run\n' +
+      '  GET /test-notify?key=...  -> test feishu alert\n', {
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+    });
   },
 };

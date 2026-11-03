@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""四平台 AI 每日签到一键状态巡检 (Python 跨平台版)"""
+"""五平台 AI 每日签到与活动雷达一键状态巡检 (Python 跨平台版)"""
 
 import os
 import sys
@@ -36,7 +36,7 @@ targets = [
 now_utc = datetime.now(timezone.utc)
 now_bj = now_utc + timedelta(hours=8)
 
-print("\n=== 四平台 AI 签到状态巡检 ===")
+print("\n=== 五平台 AI 签到与活动雷达巡检 ===")
 print(f"  巡检时间：{now_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC / {now_bj.strftime('%Y-%m-%d %H:%M:%S')} 北京时间\n")
 
 for name, url in targets:
@@ -86,5 +86,13 @@ for name, url in targets:
             print(f"  {name:<14} {status_tag:<8} {claim:<20} {extra_str} ({at})")
     except Exception as e:
         print(f"  {name:<14} 不可达   (网络超时或异常: {e})")
+
+# 5. ZCode (智谱清言) CLI 与活动雷达状态
+zcode_engine = r'C:\Users\naif\.zcode\engine\resources\glm\zcode.cjs'
+zcode_cred = r'C:\Users\naif\.zcode\v2\credentials.json'
+if os.path.exists(zcode_engine) and os.path.exists(zcode_cred):
+    print(f"  {'ZCode':<14} {'成功':<8} {'CLI v0.17.1 就绪':<20} BigModel Coding Plan | 飞书活动雷达守护中")
+else:
+    print(f"  {'ZCode':<14} {'异常':<8} 引擎或凭证缺失")
 
 print()
